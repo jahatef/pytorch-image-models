@@ -3,18 +3,40 @@ from typing import Final, Optional, Type
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
+from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
 
-from ._fx import register_notrace_function
+
 from .config import use_fused_attn
 from .pos_embed_sincos import apply_rot_embed_cat
 
 
-@torch.fx.wrap
-@register_notrace_function
 def maybe_add_mask(scores: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
     return scores if attn_mask is None else scores + attn_mask
 
+from functools import partial
+aten = torch.ops.aten
+compute_intensive_ops = [  
+   aten._scaled_dot_product_flash_attention,
+   aten._scaled_dot_product_efficient_attention,
+   aten._flash_attention_forward,
+   aten._efficient_attention_forward,
+] 
+from torch.utils.checkpoint import CheckpointPolicy
+def policy_fn(ctx, op, *args, **kwargs):
+    if op in compute_intensive_ops:
+        return CheckpointPolicy.MUST_SAVE
+    else:
+        return CheckpointPolicy.PREFER_RECOMPUTE
 
+
+def checkpoint(func,x):
+    return torch.utils.checkpoint.checkpoint(
+            func,
+            x,
+            use_reentrant=False,
+            context_fn=partial(torch.utils.checkpoint.create_selective_checkpoint_contexts, policy_fn),
+        )
+        
 class Attention(nn.Module):
     """Standard Multi-head Self Attention module with QKV projection.
 
@@ -36,8 +58,6 @@ class Attention(nn.Module):
             attn_drop: float = 0.,
             proj_drop: float = 0.,
             norm_layer: Optional[Type[nn.Module]] = None,
-            device=None,
-            dtype=None
     ) -> None:
         """Initialize the Attention module.
 
@@ -52,7 +72,6 @@ class Attention(nn.Module):
             norm_layer: Normalization layer constructor for QK normalization if enabled
         """
         super().__init__()
-        dd = {'device': device, 'dtype': dtype}
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         if qk_norm or scale_norm:
             assert norm_layer is not None, 'norm_layer must be provided if qk_norm or scale_norm is True'
@@ -61,15 +80,16 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
-        self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.norm = norm_layer(dim, **dd) if scale_norm else nn.Identity()
-        self.proj = nn.Linear(dim, dim, bias=proj_bias, **dd)
+        self.attn_drop_p = attn_drop
+        self.norm = norm_layer(dim) if scale_norm else nn.Identity()
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(
+    
+    '''def forward(
             self,
             x: torch.Tensor,
             attn_mask: Optional[torch.Tensor] = None,
@@ -97,7 +117,59 @@ class Attention(nn.Module):
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x'''
+    
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,  # not supported by FA2
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, C)
+        Returns:
+            x: (B, N, C)
+        """
+        B, N, C = x.shape
+        qkv = checkpoint(self.qkv, x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]  # (B, N, H, D)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        # Pack QKV for flash-attn v2: (B, N, 3, H, D)
+        qkv_packed = torch.stack([q, k, v], dim=2)  # (B, N, 3, H, D)
+
+        # FlashAttention v2 needs seq_len info
+        #cu_seqlens = torch.arange(0, (B + 1) * N, step=N, dtype=torch.int32, device=x.device)
+        #max_seqlen = N
+
+        # Run FlashAttention v2
+        #print(f"B: {B}, N: {N}, num_heads: {self.num_heads}, head_dim: {self.head_dim}")
+        
+        '''out = torch.utils.checkpoint.checkpoint(flash_attn_qkvpacked_func,
+            qkv_packed.reshape(B, N, 3, self.num_heads, self.head_dim),
+            use_reentrant=False,
+            dropout_p=self.attn_drop_p if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+        )  # (B*N, H, D)'''
+        
+        out = flash_attn_qkvpacked_func(
+            qkv_packed.reshape(B, N, 3, self.num_heads, self.head_dim),
+            dropout_p=self.attn_drop_p if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+        )  
+        
+
+        out = out.reshape(B, N, C)  # back to (B, N, C)
+
+        out = checkpoint(self.norm, out)
+        out = checkpoint(self.proj, out)
+        out = checkpoint(self.proj_drop, out)
+        
+        return out 
+
 
 
 class AttentionRope(nn.Module):
@@ -123,10 +195,6 @@ class AttentionRope(nn.Module):
             norm_layer: Type[nn.Module] = None,
             qk_norm: bool = False,
             scale_norm: bool = False,
-            proj_bias: bool = True,
-            rotate_half: bool = False,
-            device=None,
-            dtype=None,
     ):
         """Initialize the Attention module.
 
@@ -142,10 +210,8 @@ class AttentionRope(nn.Module):
             norm_layer: Normalization layer constructor to use for QK and scale normalization
             qk_norm: Enable normalization of query (Q) and key (K) vectors with norm_layer
             scale_norm: Enable normalization (scaling) of attention output with norm_layer
-            rotate_half: Use 'half' ROPE layout instead of default 'interleaved'
         """
         super().__init__()
-        dd = {'device': device, 'dtype': dtype}
         if scale_norm or qk_norm:
             assert norm_layer is not None, 'norm_layer must be provided if qk_norm or scale_norm is True'
         self.num_heads = num_heads
@@ -156,22 +222,21 @@ class AttentionRope(nn.Module):
         self.scale = head_dim ** -0.5
         self.num_prefix_tokens = num_prefix_tokens
         self.fused_attn = use_fused_attn()
-        self.rotate_half = rotate_half
 
         if qkv_fused:
-            self.qkv = nn.Linear(dim, attn_dim * 3, bias=qkv_bias, **dd)
+            self.qkv = nn.Linear(dim, attn_dim * 3, bias=qkv_bias)
             self.q_proj = self.k_proj = self.v_proj = None
         else:
             self.qkv = None
-            self.q_proj = nn.Linear(dim, attn_dim, bias=qkv_bias, **dd)
-            self.k_proj = nn.Linear(dim, attn_dim, bias=qkv_bias, **dd)
-            self.v_proj = nn.Linear(dim, attn_dim, bias=qkv_bias, **dd)
+            self.q_proj = nn.Linear(dim, attn_dim, bias=qkv_bias)
+            self.k_proj = nn.Linear(dim, attn_dim, bias=qkv_bias)
+            self.v_proj = nn.Linear(dim, attn_dim, bias=qkv_bias)
 
-        self.q_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
+        self.q_norm = norm_layer(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.norm = norm_layer(attn_dim, **dd) if scale_norm else nn.Identity()
-        self.proj = nn.Linear(attn_dim, dim, bias=proj_bias, **dd)
+        self.norm = norm_layer(attn_dim) if scale_norm else nn.Identity()
+        self.proj = nn.Linear(attn_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
@@ -205,9 +270,8 @@ class AttentionRope(nn.Module):
 
         if rope is not None:
             npt = self.num_prefix_tokens
-            half = getattr(self, 'rotate_half', False)
-            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope, half=half)], dim=2).type_as(v)
-            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope, half=half)], dim=2).type_as(v)
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
